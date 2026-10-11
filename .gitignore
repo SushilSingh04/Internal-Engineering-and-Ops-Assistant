@@ -1,0 +1,48 @@
+# ============================================================
+# Secrets
+# ============================================================
+.env
+.env.local
+.env.production
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# ============================================================
+# Project-specific
+# ============================================================
+
+# Trace logs (regenerated at runtime)
+traces/
+
+# Evaluation outputs
+eval_results.csv
+generated_test_data.json
+
+# Cloned repos (ephemeral ingestion directory)
+repos/
+
+# ============================================================
+# IDE / Editor
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
