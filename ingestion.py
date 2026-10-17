@@ -12,12 +12,16 @@ import hashlib
 import logging
 import os
 import shutil
+import stat
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+import git
+
 from langchain_classic.indexes import SQLRecordManager, index
-from langchain_community.document_loaders import GitLoader
+
 from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
@@ -34,6 +38,8 @@ from config import (
     EMBEDDING_MODEL,
     EMBEDDING_DIMENSIONS,
     GOOGLE_API_KEY,
+    INGESTION_BATCH_DELAY,
+    INGESTION_BATCH_SIZE,
     PINECONE_API_KEY,
     PINECONE_INDEX_NAME,
     RECORD_MANAGER_NAMESPACE,
@@ -75,7 +81,10 @@ _EXCLUDED_EXTENSIONS = {".json", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico"
 
 
 def _md_file_filter(file_path: str) -> bool:
-    """Only accept .md files, excluding dependency / binary directories."""
+    """
+    Only accept .md files, excluding dependency / binary directories.
+    Within 'locales/', strictly only allow 'en-001'.
+    """
     p = Path(file_path)
 
     # Exclude files inside unwanted directories
@@ -83,7 +92,20 @@ def _md_file_filter(file_path: str) -> bool:
         if part in _EXCLUDED_DIRS:
             return False
 
-    return p.suffix.lower() in _ALLOWED_EXTENSIONS
+    # Check extension 
+    if p.suffix.lower() not in _ALLOWED_EXTENSIONS:
+        return False
+
+    # Filter locales: inside locales/, only include en-001 or top-level files (e.g. locales/README.md)
+    parts = [part.lower() for part in p.parts]
+    if "locales" in parts:
+        loc_idx = parts.index("locales")
+        if loc_idx + 1 < len(parts):
+            sub_folder = parts[loc_idx + 1]
+            if sub_folder != "en-001" and not sub_folder.endswith(".md"):
+                return False
+
+    return True
 
 # =========================================================================
 # Splitting
@@ -118,7 +140,7 @@ def _split_document(doc: Document, doc_type: str) -> list[Document]:
     # Stage 2: fixed-size sub-chunks
     final_chunks: list[Document] = []
     source_file = doc.metadata.get("file_path", doc.metadata.get("source", "unknown"))
-    now_iso = datetime.now(timezone.utc).isoformat()
+    last_updated = doc.metadata.get("last_updated") or "2026-10-14"
 
     for hc in header_chunks:
         sub_chunks = _char_splitter.split_text(hc.page_content)
@@ -132,7 +154,7 @@ def _split_document(doc: Document, doc_type: str) -> list[Document]:
                         "source": f"{source_file}::{content_hash}",
                         "source_file": source_file,
                         "doc_type": doc_type,
-                        "last_updated": now_iso,
+                        "last_updated": last_updated,
                         # Carry forward header metadata if available
                         **{k: v for k, v in hc.metadata.items() if k.startswith("header")},
                     },
@@ -146,8 +168,29 @@ def _split_document(doc: Document, doc_type: str) -> list[Document]:
 # Clone & Load
 # =========================================================================
 
+def _safe_rmtree(path: str) -> None:
+    """Safely remove a directory tree, clearing Windows read-only flags on git pack files."""
+    if not os.path.exists(path):
+        return
+
+    def _remove_readonly(func, file_path, exc_info):
+        try:
+            os.chmod(file_path, stat.S_IWRITE)
+            func(file_path)
+        except Exception:
+            pass
+
+    shutil.rmtree(path, onerror=_remove_readonly)
+
+
 def _clone_and_load_repo(repo_config: dict) -> list[Document]:
-    """Clone a single repo and return raw Document objects (.md only)."""
+    """
+    Clone a repository without checking out files to disk (no_checkout=True).
+    Reads .md files directly from the Git object tree.
+    
+    This avoids Windows OS filename errors (e.g. reserved names like 'aux.*',
+    'con.*', or max path limits) and avoids downloading/storing unnecessary non-MD files.
+    """
     clone_url = repo_config["clone_url"]
     doc_type = repo_config["doc_type"]
     branch = repo_config.get("branch", "main")
@@ -158,43 +201,259 @@ def _clone_and_load_repo(repo_config: dict) -> list[Document]:
     abs_repo_path = str(repo_path.resolve())
     repo_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Clean previous clone (ephemeral storage on Render)
-    if os.path.exists(abs_repo_path):
-        shutil.rmtree(abs_repo_path)
+    git_dir = Path(abs_repo_path) / ".git"
+    repo: git.Repo | None = None
 
-    logger.info("Cloning %s (branch=%s) → %s", clone_url, branch, abs_repo_path)
+    # Check if a valid clone already exists
+    if git_dir.exists():
+        logger.info("Found existing clone at %s — loading directly without re-cloning", abs_repo_path)
+        try:
+            repo = git.Repo(abs_repo_path)
+        except Exception as exc:
+            logger.warning("Existing clone at %s corrupted (%s), re-cloning...", abs_repo_path, exc)
+            _safe_rmtree(abs_repo_path)
+            repo = None
+    else:
+        _safe_rmtree(abs_repo_path)
 
-    loader = GitLoader(
-        clone_url=clone_url,
-        repo_path=abs_repo_path,
-        branch=branch,
-        file_filter=_md_file_filter,
-    )
+    # Perform shallow, no-checkout clone
+    if repo is None:
+        logger.info("Cloning %s (branch=%s, no-checkout, depth=1) → %s", clone_url, branch, abs_repo_path)
+        try:
+            repo = git.Repo.clone_from(
+                clone_url,
+                abs_repo_path,
+                branch=branch,
+                no_checkout=True,
+                depth=1,
+            )
+        except Exception as shallow_err:
+            logger.warning("Shallow clone failed (%s), attempting full clone with no_checkout...", shallow_err)
+            _safe_rmtree(abs_repo_path)
+            repo = git.Repo.clone_from(
+                clone_url,
+                abs_repo_path,
+                no_checkout=True,
+            )
+            try:
+                repo.git.checkout(branch)
+            except Exception:
+                pass
 
-    raw_docs = loader.load()
+    # Extract all .md files directly from git blob tree
+    raw_docs: list[Document] = []
+    tree = repo.head.commit.tree
+    commit_date = datetime.fromtimestamp(repo.head.commit.committed_date, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    for item in tree.traverse():
+        if item.type != "blob":
+            continue
+
+        file_path = item.path  # Relative path in repo (e.g. 'incident/p1.md')
+
+        if not _md_file_filter(file_path):
+            continue
+
+        try:
+            content_bytes = item.data_stream.read()
+            text_content = content_bytes.decode("utf-8", errors="ignore")
+        except Exception as read_err:
+            logger.warning("Could not read git blob %s: %s", file_path, read_err)
+            continue
+
+        metadata = {
+            "source": file_path,
+            "file_path": file_path,
+            "file_name": Path(file_path).name,
+            "doc_type": doc_type,
+            "last_updated": commit_date,
+        }
+        raw_docs.append(Document(page_content=text_content, metadata=metadata))
+
     logger.info("Loaded %d .md files from %s", len(raw_docs), repo_name)
-
-    # Safely limit docs to avoid 429 Quota/Rate Limit errors on free tiers
-    # MAX_DOCS_PER_REPO = 50
-    # if len(raw_docs) > MAX_DOCS_PER_REPO:
-    #     logger.info("Limiting %s to first %d docs to prevent API rate limits...", repo_name, MAX_DOCS_PER_REPO)
-    #     raw_docs = raw_docs[:MAX_DOCS_PER_REPO]
-
-    # Attach doc_type to each raw document
-    for d in raw_docs:
-        d.metadata["doc_type"] = doc_type
-
     return raw_docs
 
 
-# =========================================================================
-# Public API
-# =========================================================================
+def _index_in_batches(
+    chunks: list[Document],
+    batch_size: int = INGESTION_BATCH_SIZE,
+    delay_seconds: float = INGESTION_BATCH_DELAY,
+    max_retries: int = 5,
+    max_tpm: int = 24000,  # Strict cap well under 30,000 TPM limit
+    max_rpm: int = 80,     # Strict cap well under 100 RPM limit
+) -> dict:
+    """
+    Index documents in batches with a sliding-window rate limiter
+    that strictly bounds both Tokens-Per-Minute (TPM) and Requests-Per-Minute (RPM).
+    Includes automatic exponential backoff on unexpected rate limits.
+    """
+    total_stats = {
+        "num_added": 0,
+        "num_updated": 0,
+        "num_skipped": 0,
+        "num_deleted": 0,
+    }
+    total_chunks = len(chunks)
+    total_batches = (total_chunks + batch_size - 1) // batch_size
+
+    # Sliding window history of (timestamp, token_count)
+    request_history: list[tuple[float, int]] = []
+
+    logger.info(
+        "Starting batched indexing: %d chunks across %d batches (batch_size=%d, target_tpm=%d, delay=%.1fs)",
+        total_chunks,
+        total_batches,
+        batch_size,
+        max_tpm,
+        delay_seconds,
+    )
+
+    for b_idx in range(total_batches):
+        start_i = b_idx * batch_size
+        end_i = min(start_i + batch_size, total_chunks)
+        batch = chunks[start_i:end_i]
+
+        # Estimate tokens in this batch (~4 chars per token)
+        batch_tokens = sum(max(1, len(d.page_content) // 4) for d in batch)
+
+        # ── Sliding Window Throttler (Strictly protects 30k TPM & 100 RPM) ──
+        while True:
+            now = time.time()
+            # Retain only requests within the last 60 seconds
+            request_history = [(t, tok) for t, tok in request_history if now - t < 60.0]
+            current_window_tokens = sum(tok for _, tok in request_history)
+            current_window_reqs = len(request_history)
+
+            exceeds_tpm = (current_window_tokens + batch_tokens) > max_tpm
+            exceeds_rpm = current_window_reqs >= max_rpm
+
+            if (exceeds_tpm or exceeds_rpm) and request_history:
+                oldest_timestamp = request_history[0][0]
+                sleep_needed = max(1.0, 60.0 - (now - oldest_timestamp) + 1.0)
+                logger.info(
+                    "Pacing rate: window at %d/%d tokens and %d/%d reqs. Pausing %.1fs for quota window to slide...",
+                    current_window_tokens,
+                    max_tpm,
+                    current_window_reqs,
+                    max_rpm,
+                    sleep_needed,
+                )
+                time.sleep(sleep_needed)
+            else:
+                break
+
+        logger.info(
+            "Indexing batch %d/%d (chunks %d-%d of %d, ~%d tokens)...",
+            b_idx + 1,
+            total_batches,
+            start_i + 1,
+            end_i,
+            total_chunks,
+            batch_tokens,
+        )
+
+        success = False
+        for attempt in range(max_retries):
+            try:
+                def _document_key_encoder(doc: Document) -> str:
+                    source_file = doc.metadata.get("source_file", doc.metadata.get("source", ""))
+                    doc_type = doc.metadata.get("doc_type", "")
+                    raw = f"{source_file}:{doc_type}:{doc.page_content}"
+                    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+                stats = index(
+                    docs_source=batch,
+                    record_manager=_record_manager,
+                    vector_store=_vector_store,
+                    cleanup=None,
+                    source_id_key="source",
+                    key_encoder=_document_key_encoder,
+                )
+                for k in total_stats:
+                    total_stats[k] += stats.get(k, 0)
+
+                # Record successful call in sliding window
+                request_history.append((time.time(), batch_tokens))
+
+                logger.info(
+                    "Batch %d/%d completed: added=%d, skipped=%d, updated=%d",
+                    b_idx + 1,
+                    total_batches,
+                    stats.get("num_added", 0),
+                    stats.get("num_skipped", 0),
+                    stats.get("num_updated", 0),
+                )
+                success = True
+                break
+            except Exception as exc:
+                err_str = str(exc)
+                # is_daily_quota = (
+                #     or "limit: 1000" in err_str.lower()
+                # )
+                # if is_daily_quota:
+                #     logger.warning(
+                #         "Daily Google API quota reached (1,000 requests). Gracefully saving progress. "
+                #         "%d new chunks were successfully indexed in this run. Run again tomorrow to resume!",
+                #         total_stats["num_added"],
+                #     )
+                #     return total_stats
+
+                is_rate_limit = (
+                    "429" in err_str
+                    or "RESOURCE_EXHAUSTED" in err_str
+                    or "ResourceExhausted" in err_str
+                    or "quota" in err_str.lower()
+                    or "rate limit" in err_str.lower()
+                )
+                if is_rate_limit and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 60  # 35s, 70s, 105s...
+                    logger.warning(
+                        "Rate limit hit on batch %d/%d (attempt %d/%d). Sleeping for %ds before retry. Error: %s",
+                        b_idx + 1,
+                        total_batches,
+                        attempt + 1,
+                        max_retries,
+                        wait_time,
+                        err_str[:200],
+                    )
+                    time.sleep(wait_time)
+                else:
+                    logger.error(
+                        "Failed batch %d/%d after %d attempts: %s",
+                        b_idx + 1,
+                        total_batches,
+                        attempt + 1,
+                        exc,
+                    )
+                    raise
+
+        # Respect inter-batch delay
+        if success and b_idx < total_batches - 1 and delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+    return total_stats
+
+
+def _get_indexed_source_ids() -> set[str]:
+    """Fetch all chunk source IDs already indexed in Supabase."""
+    try:
+        from sqlalchemy import create_engine, text
+        engine = create_engine(SUPABASE_DB_URL)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT DISTINCT group_id FROM upsertion_record WHERE namespace = :ns AND group_id IS NOT NULL"),
+                {"ns": RECORD_MANAGER_NAMESPACE}
+            ).fetchall()
+            return {r[0] for r in rows if r[0]}
+    except Exception as exc:
+        logger.warning("Could not fetch indexed source IDs from Supabase: %s", exc)
+        return set()
+
 
 def run_full_ingestion() -> dict:
     """
-    Clone all configured repos, split documents, and run incremental
-    sync against Pinecone via the Supabase-backed record manager.
+    Clone all configured repos, split documents, skip chunks already indexed,
+    and upsert only new chunks to Pinecone in batches across multiple runs.
 
     Returns indexing stats dict.
     """
@@ -213,19 +472,38 @@ def run_full_ingestion() -> dict:
             logger.error("Failed to process repo %s: %s", repo_cfg["clone_url"], exc)
             continue
 
-    logger.info("Total chunks to index: %d", len(all_chunks))
+    total_chunks_count = len(all_chunks)
+    logger.info("Total chunks across all repositories: %d", total_chunks_count)
 
     if not all_chunks:
         return {"num_added": 0, "num_updated": 0, "num_skipped": 0, "num_deleted": 0}
 
-    # Incremental sync: diffs hashes in Supabase, updates Pinecone accordingly
-    stats = index(
-        docs_source=all_chunks,
-        record_manager=_record_manager,
-        vector_store=_vector_store,
-        cleanup="incremental",
-        source_id_key="source",
+    # Pre-filter: skip chunks that already exist in Supabase/Pinecone
+    already_indexed = _get_indexed_source_ids()
+    unindexed_chunks = [
+        c for c in all_chunks 
+        if c.metadata.get("source") not in already_indexed
+    ]
+
+    logger.info(
+        "Ingestion progress: %d already indexed in Pinecone | %d remaining to index (out of %d total chunks)",
+        len(already_indexed),
+        len(unindexed_chunks),
+        total_chunks_count,
     )
+
+    if not unindexed_chunks:
+        logger.info("All %d documents are already indexed in Pinecone! Nothing new to embed.", total_chunks_count)
+        return {
+            "num_added": 0,
+            "num_updated": 0,
+            "num_skipped": total_chunks_count,
+            "num_deleted": 0,
+        }
+
+    # Only process chunks that have never been indexed yet
+    stats = _index_in_batches(unindexed_chunks)
+    stats["num_skipped"] = stats.get("num_skipped", 0) + len(already_indexed)
 
     logger.info("Indexing stats: %s", stats)
     return stats
@@ -255,7 +533,7 @@ def run_partial_ingestion(changed_files: list[dict]) -> dict:
     # Process only added/modified files
     chunks: list[Document] = []
     for file_info in changed_files:
-        if not file_info.get("path", "").endswith(".md"):
+        if not _md_file_filter(file_info.get("path", "")):
             continue
 
         content = file_info.get("content", "")
@@ -284,13 +562,7 @@ def run_partial_ingestion(changed_files: list[dict]) -> dict:
     if not chunks:
         return {"num_added": 0, "num_updated": 0, "num_skipped": 0, "num_deleted": 0}
 
-    stats = index(
-        docs_source=chunks,
-        record_manager=_record_manager,
-        vector_store=_vector_store,
-        cleanup="incremental",
-        source_id_key="source",
-    )
+    stats = _index_in_batches(chunks)
 
     logger.info("Partial indexing stats: %s", stats)
     return stats

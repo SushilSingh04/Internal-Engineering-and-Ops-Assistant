@@ -71,6 +71,8 @@ REPOS = [
 CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "1600"))       # ~400 tokens
 CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "200"))
 CLONE_DIR: str = os.getenv("CLONE_DIR", os.path.join(tempfile.gettempdir(), "repos"))
+INGESTION_BATCH_SIZE: int = int(os.getenv("INGESTION_BATCH_SIZE", "40"))
+INGESTION_BATCH_DELAY: float = float(os.getenv("INGESTION_BATCH_DELAY", "3.0"))
 
 # ---------------------------------------------------------------------------
 # Record Manager (LangChain indexing)
