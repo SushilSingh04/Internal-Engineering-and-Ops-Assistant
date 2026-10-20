@@ -23,7 +23,6 @@ import git
 from langchain_classic.indexes import SQLRecordManager, index
 
 from langchain_core.documents import Document
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import (
     MarkdownHeaderTextSplitter,
@@ -31,13 +30,11 @@ from langchain_text_splitters import (
 )
 from pinecone import Pinecone
 
+from embeddings import get_embeddings
 from config import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
     CLONE_DIR,
-    EMBEDDING_MODEL,
-    EMBEDDING_DIMENSIONS,
-    GOOGLE_API_KEY,
     INGESTION_BATCH_DELAY,
     INGESTION_BATCH_SIZE,
     PINECONE_API_KEY,
@@ -52,11 +49,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Shared clients
 # ---------------------------------------------------------------------------
-_embeddings = GoogleGenerativeAIEmbeddings(
-    model=EMBEDDING_MODEL, 
-    google_api_key=GOOGLE_API_KEY, 
-    output_dimensionality=EMBEDDING_DIMENSIONS
-    )
+_embeddings = get_embeddings()
 
 _pc = Pinecone(api_key=PINECONE_API_KEY)
 _index = _pc.Index(PINECONE_INDEX_NAME)

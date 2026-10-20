@@ -139,17 +139,25 @@ SYNTHESIS_PROMPT = (
 # Agent Loop
 # =========================================================================
 
-async def run_agent(query: str) -> dict:
+async def run_agent(query: str, history: list[dict] | None = None) -> dict:
     """
-    Execute the agentic RAG loop for a single user query.
+    Execute the agentic RAG loop for a user query with conversational memory.
+
+    Args:
+        query: The latest user prompt.
+        history: Optional list of prior messages: [{"role": "user"|"assistant", "content": "..."}].
 
     Returns:
         {"answer": str, "trace": dict}
     """
     tracer = TraceLogger(query)
 
+    model_name = GROQ_MODEL
+    if model_name in ("llama-3.3-70b-versatile", "llama-3.1-70b-versatile"):
+        model_name = "openai/gpt-oss-120b"
+
     llm = ChatGroq(
-        model=GROQ_MODEL,
+        model=model_name,
         api_key=GROQ_API_KEY,
         temperature=0,
     )
@@ -157,8 +165,20 @@ async def run_agent(query: str) -> dict:
 
     messages: list = [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=query),
     ]
+
+    # Inject recent conversation turns (last 6 messages = ~3 exchanges)
+    if history:
+        for msg in history[-6:]:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user" and content:
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant" and content:
+                clean_content = strip_thinking_block(content)
+                messages.append(AIMessage(content=clean_content))
+
+    messages.append(HumanMessage(content=query))
 
     for iteration in range(MAX_AGENT_ITERATIONS):
         logger.info("Agent iteration %d/%d", iteration + 1, MAX_AGENT_ITERATIONS)

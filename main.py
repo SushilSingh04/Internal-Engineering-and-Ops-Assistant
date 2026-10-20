@@ -15,7 +15,7 @@ from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agent import run_agent
 from config import TRACE_DIR, WEBHOOK_SECRET
@@ -37,6 +37,7 @@ app = FastAPI(
 
 class ChatRequest(BaseModel):
     query: str
+    history: list[dict] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):
@@ -52,12 +53,16 @@ class ChatResponse(BaseModel):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Main chat endpoint — runs the agent loop and returns answer + trace."""
-    result = await run_agent(request.query)
-    return ChatResponse(
-        answer=result["answer"],
-        trace_id=result["trace"]["trace_id"],
-        trace=result["trace"],
-    )
+    try:
+        result = await run_agent(request.query, history=request.history)
+        return ChatResponse(
+            answer=result["answer"],
+            trace_id=result["trace"]["trace_id"],
+            trace=result["trace"],
+        )
+    except Exception as exc:
+        logger.error("Error processing /chat query '%s': %s", request.query, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Agent execution error: {str(exc)}")
 
 
 # =========================================================================

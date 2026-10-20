@@ -40,6 +40,11 @@ def _render_trace_sidebar():
     """Render the trace viewer in the sidebar."""
     st.sidebar.title("🔍 Trace Viewer")
 
+    if st.sidebar.button("🗑️ Clear Conversation", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.traces = []
+        st.rerun()
+
     if not st.session_state.traces:
         st.sidebar.info("Ask a question to see the agent's reasoning trace.")
         return
@@ -142,9 +147,16 @@ def main():
         with st.chat_message("assistant"):
             with st.spinner("Thinking…"):
                 try:
+                    # Build history payload from prior turns (excluding current prompt and errors)
+                    history_payload = [
+                        {"role": m["role"], "content": m["content"]}
+                        for m in st.session_state.messages[:-1]
+                        if m.get("content") and not m["content"].startswith("⚠️")
+                    ]
+
                     response = httpx.post(
                         f"{BACKEND_URL}/chat",
-                        json={"query": prompt},
+                        json={"query": prompt, "history": history_payload},
                         timeout=120.0,
                     )
                     response.raise_for_status()

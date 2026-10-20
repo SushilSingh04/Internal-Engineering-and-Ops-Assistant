@@ -3,11 +3,16 @@ langchain>=0.3.0
 langchain-groq>=0.2.0
 langchain-google-genai>=4.0.0,<5.0.0
 langchain-pinecone>=0.2.0
-langchain-community>=0.3.0
+langchain-community>=0.3.0,<0.4.0
 langchain-tavily>=0.1.0
 
 # Vector DB
 pinecone-client>=5.0.0
+
+# Local Embeddings (1536-dimensional fallback)
+sentence-transformers>=3.0.0
+torch>=2.0.0
+einops>=0.8.0
 
 # Structured DB (Supabase Postgres)
 sqlalchemy[asyncio]>=2.0.0

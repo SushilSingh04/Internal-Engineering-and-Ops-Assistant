@@ -10,12 +10,12 @@ from __future__ import annotations
 import json
 
 from langchain_core.tools import tool
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_tavily import TavilySearch
 from pinecone import Pinecone
 from sqlalchemy import or_
 
+from embeddings import get_embeddings
 from config import (
     GOOGLE_API_KEY,
     EMBEDDING_MODEL,
@@ -31,11 +31,7 @@ from setup_db import Ticket, get_session
 # Shared clients (initialized once at module load)
 # =========================================================================
 
-_embeddings = GoogleGenerativeAIEmbeddings(
-    model=EMBEDDING_MODEL,
-    google_api_key=GOOGLE_API_KEY,
-    output_dimensionality=EMBEDDING_DIMENSIONS
-)
+_embeddings = get_embeddings()
 
 _pc = Pinecone(api_key=PINECONE_API_KEY)
 _index = _pc.Index(PINECONE_INDEX_NAME)
@@ -200,9 +196,22 @@ def web_search(query: str) -> str:
         JSON string with web results including title, URL, and content snippet.
     """
     try:
-        results = _tavily.invoke({"query": query})
+        raw_results = _tavily.invoke({"query": query})
 
-        if not results:
+        if isinstance(raw_results, dict):
+            items = raw_results.get("results", [])
+        elif isinstance(raw_results, list):
+            items = raw_results
+        elif isinstance(raw_results, str):
+            try:
+                parsed = json.loads(raw_results)
+                items = parsed.get("results", []) if isinstance(parsed, dict) else parsed
+            except Exception:
+                items = [{"title": "Web Result", "url": "", "content": raw_results}]
+        else:
+            items = []
+
+        if not items:
             return json.dumps({
                 "status": "error",
                 "tool": "web_search",
@@ -212,12 +221,13 @@ def web_search(query: str) -> str:
             })
 
         output = []
-        for r in results:
-            output.append({
-                "title": r.get("title", ""),
-                "url": r.get("url", ""),
-                "content": r.get("content", "")[:800],
-            })
+        for r in items:
+            if isinstance(r, dict):
+                output.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "content": r.get("content", "")[:800],
+                })
 
         return json.dumps({"status": "success", "results": output})
 

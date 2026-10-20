@@ -23,19 +23,27 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
+import warnings
+
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import pandas as pd
 from datasets import Dataset
 from langchain_groq import ChatGroq
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from embeddings import get_embeddings
 from ragas import EvaluationDataset, evaluate
+from ragas.run_config import RunConfig
 from ragas.metrics import (
-    AnswerRelevancy,
-    ContextPrecision,
-    ContextRecall,
-    Faithfulness,
-)
+        AnswerRelevancy,
+        ContextPrecision,
+        ContextRecall,
+        Faithfulness,
+    )
 
 from config import (
     GROQ_API_KEY,
@@ -77,6 +85,63 @@ _SAMPLE_QUESTIONS = [
 ]
 
 
+def _extract_contexts_from_trace(trace: dict) -> list[str]:
+    """Extract and format context chunks from search_docs, web_search, and query_tickets."""
+    contexts: list[str] = []
+    seen: set[str] = set()
+
+    for step in trace.get("steps", []):
+        if step.get("type") != "tool_call":
+            continue
+
+        raw_output = step.get("tool_output_truncated", "")
+        if not raw_output:
+            continue
+
+        try:
+            parsed = json.loads(raw_output) if isinstance(raw_output, str) else raw_output
+        except (json.JSONDecodeError, TypeError):
+            # Fallback for truncated/malformed JSON: extract content or description strings safely
+            matches = re.findall(r'"(?:content|description)"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', str(raw_output))
+            for m in matches:
+                clean = re.sub(r'\\n', '\n', m).strip()
+                if clean and clean not in seen:
+                    seen.add(clean)
+                    contexts.append(clean)
+            continue
+
+        if not isinstance(parsed, dict) or parsed.get("status") != "success":
+            continue
+
+        items = parsed.get("results", []) or parsed.get("tickets", [])
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            # Case A: Document chunk or web result (has 'content')
+            if item.get("content"):
+                src = item.get("source_file") or item.get("url") or ""
+                prefix = f"[{src}] " if src else ""
+                chunk = f"{prefix}{item['content'].strip()}"
+                if chunk not in seen:
+                    seen.add(chunk)
+                    contexts.append(chunk)
+
+            # Case B: Ticket (has 'title' or 'description')
+            elif item.get("title") or item.get("description"):
+                ticket_str = (
+                    f"Ticket #{item.get('id', '?')} [{item.get('priority', 'normal')}] "
+                    f"{item.get('title', '')} (Component: {item.get('component', 'N/A')}, "
+                    f"Status: {item.get('status', 'open')}, Assignee: {item.get('assignee', 'unassigned')}): "
+                    f"{item.get('description', '')}"
+                )
+                if ticket_str not in seen:
+                    seen.add(ticket_str)
+                    contexts.append(ticket_str)
+
+    return contexts if contexts else ["No context retrieved"]
+
+
 # ---------------------------------------------------------------------------
 # Generate test data by running the agent
 # ---------------------------------------------------------------------------
@@ -92,44 +157,32 @@ async def _generate_test_data() -> list[dict]:
         question = sample["question"]
         ground_truth = sample["ground_truth"]
 
-        print(f"  Running agent for: {question[:60]}…")
+        print(f"  Running agent for: {question[:60]}...")
 
         try:
             result = await run_agent(question)
             answer = result["answer"]
             trace = result["trace"]
-
-            # Extract contexts from tool call outputs in the trace
-            contexts = []
-            for step in trace.get("steps", []):
-                if step.get("type") == "tool_call":
-                    output = step.get("tool_output_truncated", "")
-                    try:
-                        parsed = json.loads(output)
-                        if parsed.get("status") == "success":
-                            for r in parsed.get("results", []):
-                                content = r.get("content", "")
-                                if content:
-                                    contexts.append(content)
-                    except (json.JSONDecodeError, TypeError):
-                        if output:
-                            contexts.append(output[:500])
+            contexts = _extract_contexts_from_trace(trace)
 
             test_data.append({
                 "user_input": question,
                 "response": answer,
-                "retrieved_contexts": contexts if contexts else ["No context retrieved"],
+                "retrieved_contexts": contexts,
                 "reference": ground_truth,
             })
 
         except Exception as exc:
-            print(f"  ⚠ Failed: {exc}")
+            print(f"  [WARN] Failed: {exc}")
             test_data.append({
                 "user_input": question,
                 "response": f"Error: {exc}",
                 "retrieved_contexts": ["No context retrieved"],
                 "reference": ground_truth,
             })
+
+        # Pacing: pause 5 seconds between queries to avoid Groq TPM rate limits
+        await asyncio.sleep(5)
 
     return test_data
 
@@ -196,13 +249,12 @@ def run_evaluation(test_data: list[dict], output_path: str = "eval_results.csv")
     eval_llm = ChatGroq(
         model=GROQ_MODEL,
         api_key=GROQ_API_KEY,
-        temperature=0
+        temperature=0,
+        max_retries=10,
+        request_timeout=120,
     )
 
-    eval_embeddings = GoogleGenerativeAIEmbeddings(
-        model=EMBEDDING_MODEL, 
-        google_api_key=GOOGLE_API_KEY
-    )
+    eval_embeddings = get_embeddings()
     # Instantiate metrics
     metrics = [
         Faithfulness(),
@@ -211,12 +263,22 @@ def run_evaluation(test_data: list[dict], output_path: str = "eval_results.csv")
         ContextRecall(),
     ]
 
+    # Rate-limit pacing configuration: run sequentially with exponential retries to prevent Groq TPM limit
+    run_config = RunConfig(
+        max_workers=1,
+        timeout=180,
+        max_retries=10,
+        max_wait=60,
+    )
+
     # Run evaluation
     results = evaluate(
         dataset=eval_dataset, 
         metrics=metrics,
         llm=eval_llm,
-        embeddings=eval_embeddings
+        embeddings=eval_embeddings,
+        run_config=run_config,
+        batch_size=1,
     )
 
     # Convert to DataFrame

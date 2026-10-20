@@ -178,7 +178,7 @@ class TraceLogger:
             "type": "tool_call",
             "tool_name": tool_name,
             "tool_input": tool_input,
-            "tool_output_truncated": tool_output_truncated[:2000],
+            "tool_output_truncated": tool_output_truncated,
             "parallel_group": parallel_group,
         })
 

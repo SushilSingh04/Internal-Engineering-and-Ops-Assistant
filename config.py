@@ -12,15 +12,20 @@ load_dotenv()
 # Groq LLM
 # ---------------------------------------------------------------------------
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-MAX_AGENT_ITERATIONS: int = int(os.getenv("MAX_AGENT_ITERATIONS", "3"))
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+if GROQ_MODEL in ("llama-3.3-70b-versatile", "llama-3.1-70b-versatile"):
+    GROQ_MODEL = "openai/gpt-oss-120b"
+MAX_AGENT_ITERATIONS: int = int(os.getenv("MAX_AGENT_ITERATIONS", "5"))
 
 # ---------------------------------------------------------------------------
-# Google Embeddings
+# Embeddings (Cloud & Local 1536-Dimensional Fallback)
 # ---------------------------------------------------------------------------
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 EMBEDDING_DIMENSIONS: int = int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
+LOCAL_EMBEDDING_MODEL: str = os.getenv("LOCAL_EMBEDDING_MODEL", "Orange/orange-nomic-v1.5-1536")
+EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "auto")  # "auto", "local", "cloud"
+ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")        # "development", "production", "local"
 
 # ---------------------------------------------------------------------------
 # Pinecone
